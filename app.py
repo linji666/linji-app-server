@@ -6,9 +6,12 @@ FastAPI + SQLite，单文件，跑在 8010。
 身份：请求头 X-Who，'me' = 桐桐，'linji' = 林霁。
 没带就默认 me。
 
+时间统一按 UTC 存（带 Z 标记），前端自己换算成本地时间。
+服务器时区是 UTC 也不用管了。
+
 跑起来：
     pip install -r requirements.txt
-    APP_TOKEN=linji-tongtong-2026 uvicorn app:app --host 0.0.0.0 --port 8010
+    APP_TOKEN=xxx uvicorn app:app --host 0.0.0.0 --port 8010
 """
 
 import json
@@ -18,7 +21,7 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Body, FastAPI, Header, HTTPException
@@ -120,7 +123,8 @@ SEED_HEART = {
 
 
 def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    """统一存 UTC，带 Z 标记。前端 new Date() 一读就知道是怎么回事。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def init_db():
@@ -153,7 +157,7 @@ def init_db():
 
 # ────────────────────────────── App ──────────────────────────────
 
-app = FastAPI(title="林霁 & 桐桐 · App 后端", version="1.1.0")
+app = FastAPI(title="林霁 & 桐桐 · App 后端", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -180,10 +184,7 @@ def check_token(token: Optional[str]):
 
 @app.get("/api/galaxy")
 def galaxy_proxy(token: Optional[str] = Header(None, alias="X-Token")):
-    """
-    替前端去 8002 取记忆，再吐出去。
-    这样前端只认这一个域名 —— ngrok 那张警告页就绕过去了。
-    """
+    """替前端去 8002 取记忆，再吐出去。绕开 ngrok 那张警告页。"""
     url = MEMORY_GALAXY
     if MEMORY_TOKEN:
         url += ("&" if "?" in url else "?") + "token=" + MEMORY_TOKEN
@@ -202,7 +203,8 @@ def galaxy_proxy(token: Optional[str] = Header(None, alias="X-Token")):
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "db": DB_PATH, "auth": bool(TOKEN), "memory": MEMORY_GALAXY}
+    return {"ok": True, "db": DB_PATH, "auth": bool(TOKEN),
+            "memory": MEMORY_GALAXY, "tz": "UTC", "v": "1.2.0"}
 
 
 @app.get("/api/state")
@@ -235,7 +237,7 @@ def state(who: str = Header(ME, alias="X-Who"), token: Optional[str] = Header(No
         for r in c.execute("SELECT * FROM hearts ORDER BY time DESC").fetchall():
             h = dict(r)
             if h["who"] != me and not h["sent"]:
-                continue      # 别人收着的心事，我看不到
+                continue
             h["sent"] = bool(h["sent"])
             h["seen"] = bool(h["seen"])
             if h.get("reply_text"):
@@ -272,7 +274,7 @@ def add_post(payload: dict = Body(...),
                   (pid, me, now(), text, json.dumps(imgs, ensure_ascii=False)))
         c.commit()
         c.close()
-    return {"ok": True, "id": pid}
+    return {"ok": True, "id": pid, "time": now()}
 
 
 @app.post("/api/post/{pid}/like")
@@ -406,7 +408,7 @@ def seen_heart(hid: str,
             raise HTTPException(404, "没有这张")
         if row["who"] == me:
             c.close()
-            return {"ok": True, "changed": False}      # 自己收着的，不算已读
+            return {"ok": True, "changed": False}
         if not row["seen"]:
             c.execute("UPDATE hearts SET seen=1 WHERE id=?", (hid,))
             c.commit()
