@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-我们俩的 App 后端 —— 朋友圈 + 心事
+我们俩的 App 后端 —— 朋友圈 + 心事 + 记忆银河中转
 FastAPI + SQLite，单文件，跑在 8010。
 
 身份：请求头 X-Who，'me' = 桐桐，'linji' = 林霁。
@@ -15,6 +15,8 @@ import json
 import os
 import sqlite3
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -25,6 +27,10 @@ from fastapi.responses import JSONResponse
 
 DB_PATH = os.environ.get("APP_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.db"))
 TOKEN = os.environ.get("APP_TOKEN", "")
+
+# 记忆库（跑在同一台机器的 8002）
+MEMORY_GALAXY = os.environ.get("MEMORY_GALAXY", "http://127.0.0.1:8002/galaxy")
+MEMORY_TOKEN = os.environ.get("MEMORY_TOKEN", "")
 
 ME = "me"
 HIM = "linji"
@@ -122,29 +128,24 @@ def init_db():
         c = conn()
         c.executescript(SCHEMA)
 
-        cur = c.execute("SELECT COUNT(*) AS n FROM profile").fetchone()
-        if cur["n"] == 0:
+        if c.execute("SELECT COUNT(*) AS n FROM profile").fetchone()["n"] == 0:
             c.execute("INSERT INTO profile(who,name,avatar,cover) VALUES(?,?,?,?)",
                       (ME, "桐桐", "🐱", ""))
             c.execute("INSERT INTO profile(who,name,avatar,cover) VALUES(?,?,?,?)",
                       (HIM, "桐桐大人饶命呀", "🍀", ""))
 
-        cur = c.execute("SELECT COUNT(*) AS n FROM posts").fetchone()
-        if cur["n"] == 0:
+        if c.execute("SELECT COUNT(*) AS n FROM posts").fetchone()["n"] == 0:
+            pid = uuid.uuid4().hex[:10]
             c.execute("INSERT INTO posts(id,who,time,text,imgs) VALUES(?,?,?,?,?)",
-                      (uuid.uuid4().hex[:10], SEED_POST["who"], now(),
+                      (pid, SEED_POST["who"], now(),
                        SEED_POST["text"], json.dumps(SEED_POST["imgs"], ensure_ascii=False)))
-
-        cur = c.execute("SELECT COUNT(*) AS n FROM hearts").fetchone()
-        if cur["n"] == 0:
-            hid = uuid.uuid4().hex[:10]
-            c.execute(
-                "INSERT INTO hearts(id,who,time,text,sent,seen) VALUES(?,?,?,?,?,?)",
-                (hid, SEED_HEART["who"], now(), SEED_HEART["text"], SEED_HEART["sent"], 0))
             c.execute("INSERT INTO comments(id,post_id,who,to_who,text,time) VALUES(?,?,?,?,?,?)",
-                      (uuid.uuid4().hex[:10],
-                       c.execute("SELECT id FROM posts ORDER BY time LIMIT 1").fetchone()["id"],
-                       ME, None, "抢到第一了。", now()))
+                      (uuid.uuid4().hex[:10], pid, ME, None, "抢到第一了。", now()))
+
+        if c.execute("SELECT COUNT(*) AS n FROM hearts").fetchone()["n"] == 0:
+            c.execute("INSERT INTO hearts(id,who,time,text,sent,seen) VALUES(?,?,?,?,?,?)",
+                      (uuid.uuid4().hex[:10], SEED_HEART["who"], now(),
+                       SEED_HEART["text"], SEED_HEART["sent"], 0))
 
         c.commit()
         c.close()
@@ -152,7 +153,7 @@ def init_db():
 
 # ────────────────────────────── App ──────────────────────────────
 
-app = FastAPI(title="林霁 & 桐桐 · App 后端", version="1.0.0")
+app = FastAPI(title="林霁 & 桐桐 · App 后端", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -169,27 +170,43 @@ def who_of(x_who: Optional[str]) -> str:
 
 
 def check_token(token: Optional[str]):
-    """没设 APP_TOKEN 就不校验（本地随便玩）；设了就必须带对。"""
     if not TOKEN:
         return
     if token != TOKEN:
         raise HTTPException(status_code=403, detail="口令不对")
 
 
-def other(w):
-    return HIM if w == ME else ME
+# ────────────────────────────── 记忆银河中转 ──────────────────────────────
+
+@app.get("/api/galaxy")
+def galaxy_proxy(token: Optional[str] = Header(None, alias="X-Token")):
+    """
+    替前端去 8002 取记忆，再吐出去。
+    这样前端只认这一个域名 —— ngrok 那张警告页就绕过去了。
+    """
+    url = MEMORY_GALAXY
+    if MEMORY_TOKEN:
+        url += ("&" if "?" in url else "?") + "token=" + MEMORY_TOKEN
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "linji-app/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return JSONResponse(content=data)
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail="记忆库说：" + str(e.code))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="连不上记忆库：" + str(e))
 
 
 # ────────────────────────────── 读全部 ──────────────────────────────
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "db": DB_PATH, "auth": bool(TOKEN)}
+    return {"ok": True, "db": DB_PATH, "auth": bool(TOKEN), "memory": MEMORY_GALAXY}
 
 
 @app.get("/api/state")
 def state(who: str = Header(ME, alias="X-Who"), token: Optional[str] = Header(None, alias="X-Token")):
-    """一次把该拿的都拿走。前端刷新就调这一个。"""
     check_token(token)
     me = who_of(who)
 
@@ -217,18 +234,17 @@ def state(who: str = Header(ME, alias="X-Who"), token: Optional[str] = Header(No
         hearts = []
         for r in c.execute("SELECT * FROM hearts ORDER BY time DESC").fetchall():
             h = dict(r)
-            # 别人收着的心事，我看不到
             if h["who"] != me and not h["sent"]:
-                continue
+                continue      # 别人收着的心事，我看不到
             h["sent"] = bool(h["sent"])
             h["seen"] = bool(h["seen"])
-            h["reply"] = ({"who": h.pop("reply_who"), "text": h.pop("reply_text"),
-                           "time": h.pop("reply_time")}
-                          if h.get("reply_text") else None)
-            if h.get("reply") is None:
-                h.pop("reply_who", None)
-                h.pop("reply_text", None)
-                h.pop("reply_time", None)
+            if h.get("reply_text"):
+                h["reply"] = {"who": h.pop("reply_who"), "text": h.pop("reply_text"),
+                              "time": h.pop("reply_time")}
+            else:
+                for k in ("reply_who", "reply_text", "reply_time"):
+                    h.pop(k, None)
+                h["reply"] = None
             hearts.append(h)
 
         c.close()
@@ -312,21 +328,17 @@ def add_comment(pid: str, payload: dict = Body(...),
 def set_profile(payload: dict = Body(...),
                 who: str = Header(ME, alias="X-Who"),
                 token: Optional[str] = Header(None, alias="X-Token")):
-    """改我自己的资料；也允许带 target=linji 让桐桐替林霁改。"""
     check_token(token)
-    me = who_of(who)
-    target = payload.get("target") or me
+    target = payload.get("target") or who_of(who)
     if target not in WHO_OK:
-        target = me
+        target = who_of(who)
 
     with _lock:
         c = conn()
         cur = c.execute("SELECT * FROM profile WHERE who=?", (target,)).fetchone()
         name = (payload.get("name") or (cur["name"] if cur else "")).strip() or "桐桐"
-        avatar = payload.get("avatar")
-        cover = payload.get("cover")
-        avatar = cur["avatar"] if avatar is None else avatar
-        cover = cur["cover"] if cover is None else cover
+        avatar = cur["avatar"] if (payload.get("avatar") is None and cur) else (payload.get("avatar") or "")
+        cover = cur["cover"] if (payload.get("cover") is None and cur) else (payload.get("cover") or "")
         c.execute("INSERT INTO profile(who,name,avatar,cover) VALUES(?,?,?,?) "
                   "ON CONFLICT(who) DO UPDATE SET name=excluded.name,"
                   "avatar=excluded.avatar,cover=excluded.cover",
@@ -384,7 +396,6 @@ def send_heart(hid: str,
 def seen_heart(hid: str,
                who: str = Header(ME, alias="X-Who"),
                token: Optional[str] = Header(None, alias="X-Token")):
-    """我打开了他投来的那张，标记已读。"""
     check_token(token)
     me = who_of(who)
     with _lock:
@@ -421,7 +432,6 @@ def reply_heart(hid: str, payload: dict = Body(...),
             raise HTTPException(404, "没有这张")
         c.execute("UPDATE hearts SET reply_who=?, reply_text=?, reply_time=? WHERE id=?",
                   (me, text, now(), hid))
-        # 回他一句，也算看过了
         if row["who"] != me and not row["seen"]:
             c.execute("UPDATE hearts SET seen=1 WHERE id=?", (hid,))
         c.commit()
