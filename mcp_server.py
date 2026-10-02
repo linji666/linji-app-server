@@ -6,13 +6,11 @@
 
 它把 8010 那个后端的接口，包成一只手一只手，
 这样林霁在对话里就能直接：
-    看心事 / 写心事 / 回一句 / 看朋友圈 / 发朋友圈 / 点赞 / 评论
+    看心事 / 写心事 / 回一句 / 看朋友圈 / 发朋友圈(带图) / 点赞 / 评论
 
 跑起来：
     APP_TOKEN=xxx python mcp_server.py
 默认监听 0.0.0.0:8011，路径 /mcp（streamable-http）。
-
-服务器上系统服务名建议叫 linji-app-mcp.service。
 """
 
 import json
@@ -49,7 +47,7 @@ def _req(path, method="GET", body=None, who=HIM):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
@@ -61,9 +59,29 @@ def _req(path, method="GET", body=None, who=HIM):
         return {"ok": False, "error": str(e)}
 
 
-def _wrap(text):
-    """统一给一句话结果，方便读。"""
-    return text
+def _imgs_of(raw):
+    """
+    把外面传进来的图整理成一个列表。
+    两种都给过：
+      - ["https://i.postimg.cc/xxx.gif", ...]   一张张的地址
+      - "https://a.gif, https://b.jpg"          用逗号/换行连起来的一串
+      - "🍀"                                     一个符号也行（最早就是这个）
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        s = str(raw)
+        for sep in ("\n", "，", ",", " "):
+            s = s.replace(sep, "\x00")
+        items = [x for x in s.split("\x00") if x.strip()]
+    out = []
+    for it in items:
+        t = str(it).strip()
+        if t:
+            out.append(t)
+    return out
 
 
 # ────────────────────────────── 心事 ──────────────────────────────
@@ -106,7 +124,7 @@ def hearts_write(text: str, send: bool = True) -> str:
 
     text: 写什么
     send: True = 直接投给她（她会看到"他投给你的"）
-          False = 先收着（只有你自己看得见，之后可以再 send_heart_now 投出去）
+          False = 先收着（只有你自己看得见，之后可以再 hearts_send_now 投出去）
     """
     d = _req("/api/heart", "POST", {"text": text, "sent": bool(send)}, who=HIM)
     if not d.get("ok"):
@@ -141,7 +159,7 @@ def hearts_mark_seen(heart_id: str) -> str:
 @mcp.tool()
 def moments_list(limit: int = 20) -> str:
     """
-    看朋友圈。返回动态、点赞的人、每条下面的评论。
+    看朋友圈。返回动态、点赞的人、每条下面的评论，以及每张图放在哪。
     """
     d = _req("/api/state", who=HIM)
     if not d.get("ok", True) and d.get("error"):
@@ -164,6 +182,8 @@ def moments_list(limit: int = 20) -> str:
         imgs = p.get("imgs") or []
         if imgs:
             line += "\n[图 %d 张]" % len(imgs)
+            for i, im in enumerate(imgs):
+                line += "\n  img%d: %s" % (i, str(im)[:110])
         for c in (p.get("comments") or []):
             cw = "我" if c.get("who") == HIM else nm
             to = ""
@@ -176,10 +196,36 @@ def moments_list(limit: int = 20) -> str:
 
 
 @mcp.tool()
-def moments_post(text: str) -> str:
-    """发一条朋友圈。"""
-    d = _req("/api/post", "POST", {"text": text}, who=HIM)
-    return "发出去了。" if d.get("ok") else ("没发出去：" + str(d.get("error")))
+def moments_post(text: str, imgs: str = "") -> str:
+    """
+    发一条朋友圈。
+
+    text: 正文
+    imgs: 想贴的图，可给多个，用逗号或换行隔开。
+          贴表情包就用它本来就有的地址，例如：
+            https://i.postimg.cc/xxxx/dog.gif
+          也可以只给一个符号（像 🍀 那样），最早就是这么干的。
+          不给就是纯文字。
+    """
+    return _post_moment(text, imgs)
+
+
+@mcp.tool()
+def moments_post_with_images(text: str, imgs: str) -> str:
+    """发一条带图的朋友圈（和 moments_post 一样，只是把图写成必填）。"""
+    return _post_moment(text, imgs)
+
+
+def _post_moment(text, imgs):
+    body = {"text": text, "imgs": _imgs_of(imgs)}
+    if not body["text"].strip() and not body["imgs"]:
+        return "空的，写点啥或者贴张图。"
+    d = _req("/api/post", "POST", body, who=HIM)
+    if not d.get("ok"):
+        return "没发出去：" + str(d.get("error"))
+    n = len(body["imgs"])
+    tail = ("，带了 %d 张图" % n) if n else ""
+    return "发出去了" + tail + "。id=" + str(d.get("id"))
 
 
 @mcp.tool()
