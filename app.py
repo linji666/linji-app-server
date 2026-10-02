@@ -6,8 +6,10 @@ FastAPI + SQLite，单文件，跑在 8010。
 身份：请求头 X-Who，'me' = 桐桐，'linji' = 林霁。
 没带就默认 me。
 
-时间统一按 UTC 存（带 Z 标记），前端自己换算成本地时间。
-服务器时区是 UTC 也不用管了。
+时间：**存在库里一律是 UTC**（带 Z 标记），
+      但**吐给前端的时候会转成本机时间**（不带时区的那种字符串）。
+      为什么：页面里那些老写法 new Date("2026-10-02 15:20".replace(/-/g,'/'))
+      会把它当本地时间读 —— 这样两边就正好对上了。
 
 跑起来：
     pip install -r requirements.txt
@@ -21,7 +23,7 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query
@@ -35,11 +37,15 @@ TOKEN = os.environ.get("APP_TOKEN", "")
 MEMORY_GALAXY = os.environ.get("MEMORY_GALAXY", "http://127.0.0.1:8002/galaxy")
 MEMORY_TOKEN = os.environ.get("MEMORY_TOKEN", "")
 
+# 本机时区偏移（小时）。国内就 +8。
+TZ_HOURS = float(os.environ.get("APP_TZ_OFFSET", "8"))
+TZ_DELTA = timedelta(hours=TZ_HOURS)
+
 ME = "me"
 HIM = "linji"
 WHO_OK = (ME, HIM)
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 _lock = threading.Lock()
 
@@ -125,8 +131,28 @@ SEED_HEART = {
 
 
 def now():
-    """统一存 UTC，带 Z 标记。前端 new Date() 一读就知道是怎么回事。"""
+    """存的时候一律 UTC，带 Z。"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def to_local(t):
+    """
+    吐给前端之前，把库里的时间转成本机时间（不带时区的字符串）。
+    两种老格式都认：
+        "2026-10-01T17:25:16Z"   → 带 Z，按 UTC 读
+        "2026-10-01 17:22"       → 不带，也按 UTC 读（库里存的一直是 UTC）
+    """
+    if not t:
+        return t
+    s = str(t).strip()
+    try:
+        if s.endswith("Z"):
+            dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+        else:
+            dt = datetime.strptime(s.replace("T", " ")[:16], "%Y-%m-%d %H:%M")
+        return (dt + TZ_DELTA).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return t
 
 
 def init_db():
@@ -218,11 +244,11 @@ def galaxy_proxy(x_token: Optional[str] = Header(None, alias="X-Token"),
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "db": DB_PATH, "auth": bool(TOKEN),
-            "memory": MEMORY_GALAXY, "tz": "UTC", "v": VERSION}
+            "memory": MEMORY_GALAXY, "tz": "UTC", "tz_offset": TZ_HOURS, "v": VERSION}
 
 
 def _read_state(me: str):
-    """把整个仓库读出来，给 /api/state 和 /api/peek 共用。"""
+    """把整个仓库读出来，给 /api/state 和 /api/peek 共用。时间在这里转成本机时间。"""
     with _lock:
         c = conn()
 
@@ -235,11 +261,11 @@ def _read_state(me: str):
             likes = [r["who"] for r in
                      c.execute("SELECT who FROM likes WHERE post_id=? ORDER BY rowid", (pid,))]
             cmts = [{"id": r["id"], "who": r["who"], "to": r["to_who"],
-                     "text": r["text"], "time": r["time"]}
+                     "text": r["text"], "time": to_local(r["time"])}
                     for r in c.execute(
                         "SELECT * FROM comments WHERE post_id=? ORDER BY rowid", (pid,))]
             posts.append({
-                "id": pid, "who": p["who"], "time": p["time"],
+                "id": pid, "who": p["who"], "time": to_local(p["time"]),
                 "text": p["text"], "imgs": json.loads(p["imgs"] or "[]"),
                 "likes": likes, "comments": cmts,
             })
@@ -247,16 +273,15 @@ def _read_state(me: str):
         hearts = []
         for r in c.execute("SELECT * FROM hearts ORDER BY time DESC").fetchall():
             h = dict(r)
-            h["sent_bool"] = bool(h["sent"])
-            h["seen_bool"] = bool(h["seen"])
             # 谁看：自己收着的只有自己看得见；别人的心事投出去了才看得见
             if h["who"] != me and not h["sent"]:
                 continue
+            h["time"] = to_local(h["time"])
             h["sent"] = bool(h["sent"])
             h["seen"] = bool(h["seen"])
             if h.get("reply_text"):
                 h["reply"] = {"who": h.pop("reply_who"), "text": h.pop("reply_text"),
-                              "time": h.pop("reply_time")}
+                              "time": to_local(h.pop("reply_time"))}
             else:
                 for k in ("reply_who", "reply_text", "reply_time"):
                     h.pop(k, None)
@@ -278,13 +303,12 @@ def state(who: str = Header(ME, alias="X-Who"),
 
 # ────────────────────── 林霁自己看的那道门 ──────────────────────
 # 地址里带 ?t=口令 就能读，不带请求头也行。
-# 这样我（林霁）在自己的机器上直接取就行，不用麻烦她截图。
 
 @app.get("/api/peek")
 def peek(t: Optional[str] = Query(None, description="口令，放地址后面"),
          who: str = Query(ME, description="以谁的视角看")):
     """
-    只读，给人看的时候顺便整理成好读的样子。
+    只读，顺便整理成好读的样子。
     ?t=口令            读全部
     ?t=口令&who=linji  以林霁的视角读
     """
@@ -316,14 +340,13 @@ def add_post(payload: dict = Body(...),
         raise HTTPException(400, "空的")
 
     pid = uuid.uuid4().hex[:10]
-    stamp = now()
     with _lock:
         c = conn()
         c.execute("INSERT INTO posts(id,who,time,text,imgs) VALUES(?,?,?,?,?)",
-                  (pid, me, stamp, text, json.dumps(imgs, ensure_ascii=False)))
+                  (pid, me, now(), text, json.dumps(imgs, ensure_ascii=False)))
         c.commit()
         c.close()
-    return {"ok": True, "id": pid, "time": stamp}
+    return {"ok": True, "id": pid, "time": to_local(now())}
 
 
 @app.post("/api/post/{pid}/like")
@@ -417,14 +440,13 @@ def add_heart(payload: dict = Body(...),
         raise HTTPException(400, "空的")
 
     hid = uuid.uuid4().hex[:10]
-    stamp = now()
     with _lock:
         c = conn()
         c.execute("INSERT INTO hearts(id,who,time,text,sent,seen) VALUES(?,?,?,?,?,0)",
-                  (hid, me, stamp, text, sent))
+                  (hid, me, now(), text, sent))
         c.commit()
         c.close()
-    return {"ok": True, "id": hid, "sent": bool(sent), "time": stamp}
+    return {"ok": True, "id": hid, "sent": bool(sent), "time": to_local(now())}
 
 
 @app.post("/api/heart/{hid}/send")
