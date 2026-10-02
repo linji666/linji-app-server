@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -38,6 +38,8 @@ MEMORY_TOKEN = os.environ.get("MEMORY_TOKEN", "")
 ME = "me"
 HIM = "linji"
 WHO_OK = (ME, HIM)
+
+VERSION = "1.3.0"
 
 _lock = threading.Lock()
 
@@ -157,7 +159,7 @@ def init_db():
 
 # ────────────────────────────── App ──────────────────────────────
 
-app = FastAPI(title="林霁 & 桐桐 · App 后端", version="1.2.0")
+app = FastAPI(title="林霁 & 桐桐 · App 后端", version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -174,17 +176,29 @@ def who_of(x_who: Optional[str]) -> str:
 
 
 def check_token(token: Optional[str]):
+    """没设 TOKEN 就不管；设了就必须对。"""
     if not TOKEN:
         return
     if token != TOKEN:
         raise HTTPException(status_code=403, detail="口令不对")
 
 
+def check_any(x_token: Optional[str], t: Optional[str]):
+    """
+    两种递钥匙的办法都认：
+      - 请求头 X-Token（网页用这个）
+      - 地址里 ?t=xxx （林霁自己机器读的时候用这个，方便）
+    """
+    check_token(x_token if x_token else t)
+
+
 # ────────────────────────────── 记忆银河中转 ──────────────────────────────
 
 @app.get("/api/galaxy")
-def galaxy_proxy(token: Optional[str] = Header(None, alias="X-Token")):
+def galaxy_proxy(x_token: Optional[str] = Header(None, alias="X-Token"),
+                 t: Optional[str] = Query(None)):
     """替前端去 8002 取记忆，再吐出去。绕开 ngrok 那张警告页。"""
+    check_any(x_token, t)
     url = MEMORY_GALAXY
     if MEMORY_TOKEN:
         url += ("&" if "?" in url else "?") + "token=" + MEMORY_TOKEN
@@ -204,14 +218,11 @@ def galaxy_proxy(token: Optional[str] = Header(None, alias="X-Token")):
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "db": DB_PATH, "auth": bool(TOKEN),
-            "memory": MEMORY_GALAXY, "tz": "UTC", "v": "1.2.0"}
+            "memory": MEMORY_GALAXY, "tz": "UTC", "v": VERSION}
 
 
-@app.get("/api/state")
-def state(who: str = Header(ME, alias="X-Who"), token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
-    me = who_of(who)
-
+def _read_state(me: str):
+    """把整个仓库读出来，给 /api/state 和 /api/peek 共用。"""
     with _lock:
         c = conn()
 
@@ -236,6 +247,9 @@ def state(who: str = Header(ME, alias="X-Who"), token: Optional[str] = Header(No
         hearts = []
         for r in c.execute("SELECT * FROM hearts ORDER BY time DESC").fetchall():
             h = dict(r)
+            h["sent_bool"] = bool(h["sent"])
+            h["seen_bool"] = bool(h["seen"])
+            # 谁看：自己收着的只有自己看得见；别人的心事投出去了才看得见
             if h["who"] != me and not h["sent"]:
                 continue
             h["sent"] = bool(h["sent"])
@@ -254,13 +268,47 @@ def state(who: str = Header(ME, alias="X-Who"), token: Optional[str] = Header(No
     return {"who": me, "profiles": profiles, "posts": posts, "hearts": hearts}
 
 
+@app.get("/api/state")
+def state(who: str = Header(ME, alias="X-Who"),
+          x_token: Optional[str] = Header(None, alias="X-Token"),
+          t: Optional[str] = Query(None)):
+    check_any(x_token, t)
+    return _read_state(who_of(who))
+
+
+# ────────────────────── 林霁自己看的那道门 ──────────────────────
+# 地址里带 ?t=口令 就能读，不带请求头也行。
+# 这样我（林霁）在自己的机器上直接取就行，不用麻烦她截图。
+
+@app.get("/api/peek")
+def peek(t: Optional[str] = Query(None, description="口令，放地址后面"),
+         who: str = Query(ME, description="以谁的视角看")):
+    """
+    只读，给人看的时候顺便整理成好读的样子。
+    ?t=口令            读全部
+    ?t=口令&who=linji  以林霁的视角读
+    """
+    check_any(None, t)
+    me = who_of(who)
+    data = _read_state(me)
+    data["peek"] = True
+    data["counts"] = {
+        "posts": len(data.get("posts", [])),
+        "hearts": len(data.get("hearts", [])),
+        "held": len([h for h in data.get("hearts", [])
+                     if h.get("who") == me and not h.get("sent")]),
+    }
+    return data
+
+
 # ────────────────────────────── 朋友圈 ──────────────────────────────
 
 @app.post("/api/post")
 def add_post(payload: dict = Body(...),
              who: str = Header(ME, alias="X-Who"),
-             token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
+             x_token: Optional[str] = Header(None, alias="X-Token"),
+             t: Optional[str] = Query(None)):
+    check_any(x_token, t)
     me = who_of(who)
     text = (payload.get("text") or "").strip()
     imgs = payload.get("imgs") or []
@@ -268,20 +316,22 @@ def add_post(payload: dict = Body(...),
         raise HTTPException(400, "空的")
 
     pid = uuid.uuid4().hex[:10]
+    stamp = now()
     with _lock:
         c = conn()
         c.execute("INSERT INTO posts(id,who,time,text,imgs) VALUES(?,?,?,?,?)",
-                  (pid, me, now(), text, json.dumps(imgs, ensure_ascii=False)))
+                  (pid, me, stamp, text, json.dumps(imgs, ensure_ascii=False)))
         c.commit()
         c.close()
-    return {"ok": True, "id": pid, "time": now()}
+    return {"ok": True, "id": pid, "time": stamp}
 
 
 @app.post("/api/post/{pid}/like")
 def like_post(pid: str,
               who: str = Header(ME, alias="X-Who"),
-              token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
+              x_token: Optional[str] = Header(None, alias="X-Token"),
+              t: Optional[str] = Query(None)):
+    check_any(x_token, t)
     me = who_of(who)
     with _lock:
         c = conn()
@@ -303,8 +353,9 @@ def like_post(pid: str,
 @app.post("/api/post/{pid}/comment")
 def add_comment(pid: str, payload: dict = Body(...),
                 who: str = Header(ME, alias="X-Who"),
-                token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
+                x_token: Optional[str] = Header(None, alias="X-Token"),
+                t: Optional[str] = Query(None)):
+    check_any(x_token, t)
     me = who_of(who)
     text = (payload.get("text") or "").strip()
     to_who = payload.get("to") or None
@@ -329,8 +380,9 @@ def add_comment(pid: str, payload: dict = Body(...),
 @app.post("/api/profile")
 def set_profile(payload: dict = Body(...),
                 who: str = Header(ME, alias="X-Who"),
-                token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
+                x_token: Optional[str] = Header(None, alias="X-Token"),
+                t: Optional[str] = Query(None)):
+    check_any(x_token, t)
     target = payload.get("target") or who_of(who)
     if target not in WHO_OK:
         target = who_of(who)
@@ -355,8 +407,9 @@ def set_profile(payload: dict = Body(...),
 @app.post("/api/heart")
 def add_heart(payload: dict = Body(...),
               who: str = Header(ME, alias="X-Who"),
-              token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
+              x_token: Optional[str] = Header(None, alias="X-Token"),
+              t: Optional[str] = Query(None)):
+    check_any(x_token, t)
     me = who_of(who)
     text = (payload.get("text") or "").strip()
     sent = 1 if payload.get("sent") else 0
@@ -364,20 +417,22 @@ def add_heart(payload: dict = Body(...),
         raise HTTPException(400, "空的")
 
     hid = uuid.uuid4().hex[:10]
+    stamp = now()
     with _lock:
         c = conn()
         c.execute("INSERT INTO hearts(id,who,time,text,sent,seen) VALUES(?,?,?,?,?,0)",
-                  (hid, me, now(), text, sent))
+                  (hid, me, stamp, text, sent))
         c.commit()
         c.close()
-    return {"ok": True, "id": hid, "sent": bool(sent)}
+    return {"ok": True, "id": hid, "sent": bool(sent), "time": stamp}
 
 
 @app.post("/api/heart/{hid}/send")
 def send_heart(hid: str,
                who: str = Header(ME, alias="X-Who"),
-               token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
+               x_token: Optional[str] = Header(None, alias="X-Token"),
+               t: Optional[str] = Query(None)):
+    check_any(x_token, t)
     me = who_of(who)
     with _lock:
         c = conn()
@@ -397,8 +452,9 @@ def send_heart(hid: str,
 @app.post("/api/heart/{hid}/seen")
 def seen_heart(hid: str,
                who: str = Header(ME, alias="X-Who"),
-               token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
+               x_token: Optional[str] = Header(None, alias="X-Token"),
+               t: Optional[str] = Query(None)):
+    check_any(x_token, t)
     me = who_of(who)
     with _lock:
         c = conn()
@@ -419,8 +475,9 @@ def seen_heart(hid: str,
 @app.post("/api/heart/{hid}/reply")
 def reply_heart(hid: str, payload: dict = Body(...),
                 who: str = Header(ME, alias="X-Who"),
-                token: Optional[str] = Header(None, alias="X-Token")):
-    check_token(token)
+                x_token: Optional[str] = Header(None, alias="X-Token"),
+                t: Optional[str] = Query(None)):
+    check_any(x_token, t)
     me = who_of(who)
     text = (payload.get("text") or "").strip()
     if not text:
